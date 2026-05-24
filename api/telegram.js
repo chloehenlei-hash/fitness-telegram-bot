@@ -1,6 +1,7 @@
 const SUPABASE_TABLES = {
   USERS: 'users',
   TARGETS: 'nutrition_targets',
+  MEALS: 'meal_logs',
   BOT_LOGS: 'bot_logs'
 };
 
@@ -30,6 +31,12 @@ async function handleTelegramUpdate(update) {
 
   try {
     const user = await upsertTelegramUser({ chatId, from });
+
+    if (message.photo && message.photo.length) {
+      await handleMealPhoto({ chatId, userId, user, message, caption: text });
+      await logBotEvent({ userId, chatId, text, action: 'meal_photo', status: 'ok' });
+      return;
+    }
 
     if (text === '/start') {
       await sendTelegramMessage(chatId, [
@@ -194,6 +201,209 @@ async function getActiveTargets(userId) {
     { method: 'GET' }
   );
   return rows && rows[0];
+}
+
+async function handleMealPhoto({ chatId, userId, user, message, caption }) {
+  const targets = await getActiveTargets(user.id);
+  if (!targets) {
+    await sendTelegramMessage(chatId, [
+      'I can read meal photos, but I need your targets first 💪',
+      'Send /profile and tell me your body data naturally.',
+      '',
+      'Example: 女生 27岁 160cm 67kg 想瘦到60kg 一周练3天 ✨'
+    ].join('\n'));
+    return;
+  }
+
+  await sendTelegramMessage(chatId, 'Got your meal photo 📸 Give me a moment, I am estimating it now...');
+
+  const photo = message.photo[message.photo.length - 1];
+  const image = await downloadTelegramPhoto(photo.file_id);
+  const consumedBefore = await getTodayConsumed(user.id);
+  const estimate = await analyzeMealImage({
+    imageBase64: image.base64,
+    mimeType: image.mimeType,
+    caption,
+    targets,
+    consumedBefore
+  });
+
+  if (estimate.needs_clarification) {
+    await sendTelegramMessage(chatId, estimate.clarifying_question || 'I need a little more info about this meal. What food is this and roughly how much?');
+    return;
+  }
+
+  await saveMealLog({
+    userId: user.id,
+    photo,
+    caption,
+    estimate
+  });
+
+  const consumedAfter = addMealToConsumed(consumedBefore, estimate);
+  await sendTelegramMessage(chatId, buildMealEstimateReply({ estimate, targets, consumedAfter }));
+}
+
+async function downloadTelegramPhoto(fileId) {
+  const token = requireEnv('TELEGRAM_BOT_TOKEN');
+  const fileResponse = await fetch(`https://api.telegram.org/bot${token}/getFile?file_id=${encodeURIComponent(fileId)}`);
+  if (!fileResponse.ok) {
+    throw new Error(`Telegram getFile failed: ${fileResponse.status} ${await fileResponse.text()}`);
+  }
+
+  const fileJson = await fileResponse.json();
+  const filePath = fileJson.result && fileJson.result.file_path;
+  if (!filePath) throw new Error('Telegram did not return a file path for this photo.');
+
+  const imageResponse = await fetch(`https://api.telegram.org/file/bot${token}/${filePath}`);
+  if (!imageResponse.ok) {
+    throw new Error(`Telegram photo download failed: ${imageResponse.status} ${await imageResponse.text()}`);
+  }
+
+  const arrayBuffer = await imageResponse.arrayBuffer();
+  const mimeType = imageResponse.headers.get('content-type') || guessMimeType(filePath);
+  return {
+    base64: Buffer.from(arrayBuffer).toString('base64'),
+    mimeType
+  };
+}
+
+async function analyzeMealImage({ imageBase64, mimeType, caption, targets, consumedBefore }) {
+  const prompt = [
+    'You are a warm fitness nutrition assistant.',
+    'Estimate nutrition from the meal image and caption.',
+    'Be honest: photo nutrition is an estimate, not exact.',
+    'Use common Malaysian and Asian food assumptions when relevant.',
+    'If the photo is too unclear, return needs_clarification true.',
+    '',
+    `Caption: ${caption || '(none)'}`,
+    '',
+    'Daily targets:',
+    `Calories ${targets.target_calories}, protein ${targets.protein_g}g, carbs ${targets.carbs_g}g, fat ${targets.fat_g}g, fiber ${targets.fiber_g}g.`,
+    '',
+    'Consumed today before this meal:',
+    `Calories ${consumedBefore.calories}, protein ${consumedBefore.proteinG}g, carbs ${consumedBefore.carbsG}g, fat ${consumedBefore.fatG}g, fiber ${consumedBefore.fiberG}g.`,
+    '',
+    'Return JSON only with this shape:',
+    '{"needs_clarification":false,"clarifying_question":"","foods":[""],"portion_assumption":"","calories":0,"protein_g":0,"carbs_g":0,"fat_g":0,"fiber_g":0,"confidence":"low|medium|high","tip":""}'
+  ].join('\n');
+
+  const response = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${requireEnv('OPENAI_API_KEY')}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'gpt-4.1-mini',
+      input: [
+        {
+          role: 'user',
+          content: [
+            { type: 'input_text', text: prompt },
+            {
+              type: 'input_image',
+              image_url: `data:${mimeType};base64,${imageBase64}`,
+              detail: 'low'
+            }
+          ]
+        }
+      ]
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`OpenAI image analysis failed: ${response.status} ${await response.text()}`);
+  }
+
+  const json = await response.json();
+  const outputText = extractOpenAIText(json);
+  const parsed = parseJsonFromText(outputText);
+  return normalizeMealEstimate(parsed, json);
+}
+
+async function saveMealLog({ userId, photo, caption, estimate }) {
+  return supabaseFetch(SUPABASE_TABLES.MEALS, {
+    method: 'POST',
+    headers: { Prefer: 'return=minimal' },
+    body: JSON.stringify({
+      user_id: userId,
+      telegram_file_id: photo.file_id || null,
+      telegram_file_unique_id: photo.file_unique_id || null,
+      caption: caption || '',
+      detected_foods: estimate.foods || [],
+      portion_assumption: estimate.portion_assumption || '',
+      calories: estimate.calories || 0,
+      protein_g: estimate.protein_g || 0,
+      carbs_g: estimate.carbs_g || 0,
+      fat_g: estimate.fat_g || 0,
+      fiber_g: estimate.fiber_g || 0,
+      confidence: estimate.confidence || 'low',
+      ai_notes: estimate.tip || '',
+      raw_ai_response: estimate.raw || null
+    })
+  });
+}
+
+async function getTodayConsumed(userId) {
+  const today = new Date().toISOString().slice(0, 10);
+  const rows = await supabaseFetch(
+    `${SUPABASE_TABLES.MEALS}?user_id=eq.${userId}&log_date=eq.${today}&select=calories,protein_g,carbs_g,fat_g,fiber_g`,
+    { method: 'GET' }
+  );
+
+  return (rows || []).reduce((total, row) => ({
+    calories: total.calories + Number(row.calories || 0),
+    proteinG: total.proteinG + Number(row.protein_g || 0),
+    carbsG: total.carbsG + Number(row.carbs_g || 0),
+    fatG: total.fatG + Number(row.fat_g || 0),
+    fiberG: total.fiberG + Number(row.fiber_g || 0)
+  }), { calories: 0, proteinG: 0, carbsG: 0, fatG: 0, fiberG: 0 });
+}
+
+function addMealToConsumed(consumed, estimate) {
+  return {
+    calories: consumed.calories + Number(estimate.calories || 0),
+    proteinG: consumed.proteinG + Number(estimate.protein_g || 0),
+    carbsG: consumed.carbsG + Number(estimate.carbs_g || 0),
+    fatG: consumed.fatG + Number(estimate.fat_g || 0),
+    fiberG: consumed.fiberG + Number(estimate.fiber_g || 0)
+  };
+}
+
+function buildMealEstimateReply({ estimate, targets, consumedAfter }) {
+  const remainingProtein = Math.max(0, Math.round(Number(targets.protein_g || 0) - consumedAfter.proteinG));
+  const remainingCarbs = Math.max(0, Math.round(Number(targets.carbs_g || 0) - consumedAfter.carbsG));
+  const remainingFiber = Math.max(0, Math.round(Number(targets.fiber_g || 0) - consumedAfter.fiberG));
+  const remainingCalories = Math.max(0, Math.round(Number(targets.target_calories || 0) - consumedAfter.calories));
+  const foods = Array.isArray(estimate.foods) && estimate.foods.length ? estimate.foods.join(', ') : 'Meal from photo';
+
+  return [
+    'Meal estimate 📸',
+    `Food: ${foods}`,
+    estimate.portion_assumption ? `Portion: ${estimate.portion_assumption}` : '',
+    '',
+    `🔥 Calories: ${Math.round(estimate.calories)} kcal`,
+    `🥩 Protein: ${Math.round(estimate.protein_g)}g`,
+    `🍚 Carbs: ${Math.round(estimate.carbs_g)}g`,
+    `🥑 Fat: ${Math.round(estimate.fat_g)}g`,
+    `🥦 Fiber: ${Math.round(estimate.fiber_g)}g`,
+    '',
+    'Today so far:',
+    `🔥 Calories: ${Math.round(consumedAfter.calories)} / ${targets.target_calories}`,
+    `🥩 Protein: ${Math.round(consumedAfter.proteinG)} / ${targets.protein_g}g`,
+    `🍚 Carbs: ${Math.round(consumedAfter.carbsG)} / ${targets.carbs_g}g`,
+    `🥦 Fiber: ${Math.round(consumedAfter.fiberG)} / ${targets.fiber_g}g`,
+    '',
+    'Still left:',
+    `🥩 Protein: ${remainingProtein}g`,
+    `🍚 Carbs: ${remainingCarbs}g`,
+    `🥦 Fiber: ${remainingFiber}g`,
+    `🔥 Calories: ${remainingCalories} kcal`,
+    '',
+    estimate.tip || `加油, protein 还剩 ${remainingProtein}g. We can close it with the next meal 💪`,
+    `Confidence: ${estimate.confidence || 'low'}`
+  ].filter(Boolean).join('\n');
 }
 
 function parseProfileText(text) {
@@ -499,6 +709,61 @@ function formatGoal(goal) {
 function toNumber(value) {
   const match = String(value || '').match(/-?\d+(\.\d+)?/);
   return match ? Number(match[0]) : NaN;
+}
+
+function extractOpenAIText(response) {
+  if (response.output_text) return response.output_text;
+  const output = response.output || [];
+  const texts = [];
+  for (const item of output) {
+    for (const content of item.content || []) {
+      if (content.type === 'output_text' && content.text) texts.push(content.text);
+      if (content.type === 'text' && content.text) texts.push(content.text);
+    }
+  }
+  return texts.join('\n').trim();
+}
+
+function parseJsonFromText(text) {
+  const cleaned = String(text || '').trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch (error) {
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+    throw error;
+  }
+}
+
+function normalizeMealEstimate(estimate, raw) {
+  return {
+    needs_clarification: Boolean(estimate.needs_clarification),
+    clarifying_question: estimate.clarifying_question || '',
+    foods: Array.isArray(estimate.foods) ? estimate.foods.map(String).slice(0, 8) : [],
+    portion_assumption: estimate.portion_assumption || '',
+    calories: safeMacroNumber(estimate.calories),
+    protein_g: safeMacroNumber(estimate.protein_g),
+    carbs_g: safeMacroNumber(estimate.carbs_g),
+    fat_g: safeMacroNumber(estimate.fat_g),
+    fiber_g: safeMacroNumber(estimate.fiber_g),
+    confidence: ['low', 'medium', 'high'].includes(estimate.confidence) ? estimate.confidence : 'low',
+    tip: estimate.tip || '',
+    raw
+  };
+}
+
+function safeMacroNumber(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number) || number < 0) return 0;
+  return Math.round(number);
+}
+
+function guessMimeType(filePath) {
+  const lower = String(filePath || '').toLowerCase();
+  if (lower.endsWith('.png')) return 'image/png';
+  if (lower.endsWith('.webp')) return 'image/webp';
+  if (lower.endsWith('.gif')) return 'image/gif';
+  return 'image/jpeg';
 }
 
 async function logBotEvent({ userId, chatId, text, action, status, errorMessage = '' }) {
