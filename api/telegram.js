@@ -33,8 +33,14 @@ async function handleTelegramUpdate(update) {
     const user = await upsertTelegramUser({ chatId, from });
 
     if (message.photo && message.photo.length) {
-      await handleMealPhoto({ chatId, userId, user, message, caption: text });
-      await logBotEvent({ userId, chatId, text, action: 'meal_photo', status: 'ok' });
+      try {
+        await handleMealPhoto({ chatId, userId, user, message, caption: text });
+        await logBotEvent({ userId, chatId, text, action: 'meal_photo', status: 'ok' });
+      } catch (error) {
+        console.error('meal photo error', error);
+        await sendTelegramMessage(chatId, buildPhotoErrorReply(error));
+        await logBotEvent({ userId, chatId, text, action: 'meal_photo', status: 'error', errorMessage: error.message });
+      }
       return;
     }
 
@@ -113,12 +119,8 @@ async function handleTelegramUpdate(update) {
       return;
     }
 
-    await sendTelegramMessage(chatId, [
-      'I am here with you 💪',
-      'Start with /profile so I can calculate your daily targets.',
-      '',
-      'After that, we will track meals, see how much protein/fiber is left, and keep going step by step ✨'
-    ].join('\n'));
+    const targets = await getActiveTargets(user.id);
+    await sendTelegramMessage(chatId, buildFallbackReply(Boolean(targets)));
     await logBotEvent({ userId, chatId, text, action: 'fallback', status: 'ok' });
   } catch (error) {
     await safeSendTelegramMessage(chatId, 'Oops, I hit a setup error 😭 Please ask Chloe to check the backend settings. We are close, do not give up 💪');
@@ -261,7 +263,8 @@ async function downloadTelegramPhoto(fileId) {
   }
 
   const arrayBuffer = await imageResponse.arrayBuffer();
-  const mimeType = imageResponse.headers.get('content-type') || guessMimeType(filePath);
+  const headerMimeType = imageResponse.headers.get('content-type');
+  const mimeType = isSupportedImageMime(headerMimeType) ? headerMimeType : guessMimeType(filePath);
   return {
     base64: Buffer.from(arrayBuffer).toString('base64'),
     mimeType
@@ -748,7 +751,11 @@ function normalizeMealEstimate(estimate, raw) {
     fiber_g: safeMacroNumber(estimate.fiber_g),
     confidence: ['low', 'medium', 'high'].includes(estimate.confidence) ? estimate.confidence : 'low',
     tip: estimate.tip || '',
-    raw
+    raw: {
+      id: raw && raw.id,
+      model: raw && raw.model,
+      output_text: extractOpenAIText(raw).slice(0, 2000)
+    }
   };
 }
 
@@ -764,6 +771,87 @@ function guessMimeType(filePath) {
   if (lower.endsWith('.webp')) return 'image/webp';
   if (lower.endsWith('.gif')) return 'image/gif';
   return 'image/jpeg';
+}
+
+function isSupportedImageMime(mimeType) {
+  return ['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(String(mimeType || '').toLowerCase());
+}
+
+function buildFallbackReply(hasTargets) {
+  if (hasTargets) {
+    return [
+      'I have your profile saved already 💪',
+      '',
+      'You can send me:',
+      '📸 a meal photo, like "mala panmee"',
+      '🎯 /targets to see your daily goals',
+      '🏋️ what you want to train and what machines you have',
+      '',
+      'No need to set profile again. We keep going from here ✨'
+    ].join('\n');
+  }
+
+  return [
+    'I am here with you 💪',
+    'Send /profile first so I can calculate your daily targets.',
+    '',
+    'After that, you can send meal photos and I will track what is left for the day ✨'
+  ].join('\n');
+}
+
+function buildPhotoErrorReply(error) {
+  const message = String(error && error.message ? error.message : error);
+
+  if (/Missing environment variable: OPENAI_API_KEY/.test(message)) {
+    return [
+      'I can see your meal photo, but my AI vision key is not connected yet 😭',
+      'Chloe needs to add `OPENAI_API_KEY` in Vercel Environment Variables, then redeploy.',
+      '',
+      'After that, send the meal photo again and I will estimate calories + protein + carbs + fiber 💪'
+    ].join('\n');
+  }
+
+  if (/OpenAI image analysis failed: 401/.test(message)) {
+    return [
+      'I tried to read the meal photo, but the OpenAI key looks invalid or expired 😭',
+      'Chloe needs to check `OPENAI_API_KEY` in Vercel and redeploy.',
+      '',
+      'We are close. Once the key is fixed, I can estimate the meal properly 💪'
+    ].join('\n');
+  }
+
+  if (/OpenAI image analysis failed: 429/.test(message)) {
+    return 'I tried to read the meal photo, but the AI limit is busy right now 😭 Try again in a bit, okay? 💪';
+  }
+
+  if (/OpenAI image analysis failed/.test(message)) {
+    return [
+      'I tried to read the meal photo, but the AI vision step failed 😭',
+      'Please try one more time with a clearer photo and a short caption like "mala panmee".',
+      '',
+      'If it still fails, Chloe should check Vercel Function Logs for the OpenAI error.'
+    ].join('\n');
+  }
+
+  if (/Telegram .*photo|Telegram getFile|Telegram photo download/.test(message)) {
+    return 'I received the photo, but Telegram would not let me download it properly 😭 Please send it again as a normal photo, not a file.';
+  }
+
+  if (/Supabase request failed/.test(message)) {
+    return [
+      'I estimated the meal, but saving it to the database failed 😭',
+      'Chloe should check Supabase tables and Vercel env keys.',
+      '',
+      'Do not worry, this is a setup issue, not your photo 💪'
+    ].join('\n');
+  }
+
+  return [
+    'I got your meal photo, but something broke while estimating it 😭',
+    'Try sending it again with a short caption, for example: "mala panmee".',
+    '',
+    'If it repeats, Chloe can check Vercel Function Logs and we will fix it 💪'
+  ].join('\n');
 }
 
 async function logBotEvent({ userId, chatId, text, action, status, errorMessage = '' }) {
