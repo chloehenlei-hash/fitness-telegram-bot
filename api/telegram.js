@@ -291,6 +291,61 @@ async function analyzeMealImage({ imageBase64, mimeType, caption, targets, consu
     '{"needs_clarification":false,"clarifying_question":"","foods":[""],"portion_assumption":"","calories":0,"protein_g":0,"carbs_g":0,"fat_g":0,"fiber_g":0,"confidence":"low|medium|high","tip":""}'
   ].join('\n');
 
+  if (process.env.GEMINI_API_KEY) {
+    return analyzeMealImageWithGemini({ imageBase64, mimeType, prompt });
+  }
+
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('Missing image AI key: add GEMINI_API_KEY or OPENAI_API_KEY');
+  }
+
+  return analyzeMealImageWithOpenAI({ imageBase64, mimeType, prompt });
+}
+
+async function analyzeMealImageWithGemini({ imageBase64, mimeType, prompt }) {
+  const model = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+    method: 'POST',
+    headers: {
+      'x-goog-api-key': requireEnv('GEMINI_API_KEY'),
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      contents: [
+        {
+          parts: [
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: imageBase64
+              }
+            },
+            { text: prompt }
+          ]
+        }
+      ],
+      generationConfig: {
+        temperature: 0.2,
+        response_mime_type: 'application/json'
+      }
+    })
+  });
+
+  if (!response.ok) {
+    throw new Error(`Gemini image analysis failed: ${response.status} ${await response.text()}`);
+  }
+
+  const json = await response.json();
+  const outputText = extractGeminiText(json);
+  const parsed = parseJsonFromText(outputText);
+  return normalizeMealEstimate(parsed, {
+    provider: 'gemini',
+    model,
+    output_text: outputText
+  });
+}
+
+async function analyzeMealImageWithOpenAI({ imageBase64, mimeType, prompt }) {
   const response = await fetch('https://api.openai.com/v1/responses', {
     method: 'POST',
     headers: {
@@ -727,6 +782,17 @@ function extractOpenAIText(response) {
   return texts.join('\n').trim();
 }
 
+function extractGeminiText(response) {
+  const candidates = response.candidates || [];
+  const texts = [];
+  for (const candidate of candidates) {
+    for (const part of (candidate.content && candidate.content.parts) || []) {
+      if (part.text) texts.push(part.text);
+    }
+  }
+  return texts.join('\n').trim();
+}
+
 function parseJsonFromText(text) {
   const cleaned = String(text || '').trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/```$/i, '').trim();
   try {
@@ -739,6 +805,7 @@ function parseJsonFromText(text) {
 }
 
 function normalizeMealEstimate(estimate, raw) {
+  const outputText = raw && raw.provider === 'gemini' ? raw.output_text : extractOpenAIText(raw || {});
   return {
     needs_clarification: Boolean(estimate.needs_clarification),
     clarifying_question: estimate.clarifying_question || '',
@@ -752,9 +819,10 @@ function normalizeMealEstimate(estimate, raw) {
     confidence: ['low', 'medium', 'high'].includes(estimate.confidence) ? estimate.confidence : 'low',
     tip: estimate.tip || '',
     raw: {
+      provider: raw && raw.provider ? raw.provider : 'openai',
       id: raw && raw.id,
       model: raw && raw.model,
-      output_text: extractOpenAIText(raw).slice(0, 2000)
+      output_text: outputText.slice(0, 2000)
     }
   };
 }
@@ -805,9 +873,54 @@ function buildPhotoErrorReply(error) {
   if (/Missing environment variable: OPENAI_API_KEY/.test(message)) {
     return [
       'I can see your meal photo, but my AI vision key is not connected yet 😭',
-      'Chloe needs to add `OPENAI_API_KEY` in Vercel Environment Variables, then redeploy.',
+      'Chloe needs to add `GEMINI_API_KEY` or `OPENAI_API_KEY` in Vercel Environment Variables, then redeploy.',
       '',
       'After that, send the meal photo again and I will estimate calories + protein + carbs + fiber 💪'
+    ].join('\n');
+  }
+
+  if (/Missing image AI key|Missing environment variable: GEMINI_API_KEY/.test(message)) {
+    return [
+      'I can see your meal photo, but Gemini is not connected yet 😭',
+      'Chloe needs to add `GEMINI_API_KEY` in Vercel Environment Variables, then redeploy.',
+      '',
+      'After that, send the meal photo again and I will estimate calories + protein + carbs + fiber 💪'
+    ].join('\n');
+  }
+
+  if (/Gemini image analysis failed: 400/.test(message)) {
+    return [
+      'I tried to read the meal photo with Gemini, but the image request was rejected 😭',
+      'Please try sending the photo again as a normal Telegram photo with a short caption.',
+      '',
+      'If it repeats, Chloe should check Vercel logs for the Gemini error.'
+    ].join('\n');
+  }
+
+  if (/Gemini image analysis failed: 401|Gemini image analysis failed: 403/.test(message)) {
+    return [
+      'I tried to read the meal photo, but the Gemini API key is not allowed or not valid 😭',
+      'Chloe needs to check `GEMINI_API_KEY` in Vercel, then redeploy.',
+      '',
+      'Once the key is fixed, I can estimate the meal properly 💪'
+    ].join('\n');
+  }
+
+  if (/Gemini image analysis failed: 429/.test(message)) {
+    return [
+      'I tried to read the meal photo, but Gemini is rate-limiting or quota-limiting requests right now 😭',
+      'Try again later, or Chloe can check Gemini API quota/limits for the key.',
+      '',
+      'We are close 💪'
+    ].join('\n');
+  }
+
+  if (/Gemini image analysis failed/.test(message)) {
+    return [
+      'I tried to read the meal photo with Gemini, but the AI step failed 😭',
+      'Please try one clearer photo with a short caption like "mala panmee".',
+      '',
+      'If it repeats, Chloe should check Vercel Function Logs for the Gemini error.'
     ].join('\n');
   }
 
@@ -821,7 +934,21 @@ function buildPhotoErrorReply(error) {
   }
 
   if (/OpenAI image analysis failed: 429/.test(message)) {
-    return 'I tried to read the meal photo, but the AI limit is busy right now 😭 Try again in a bit, okay? 💪';
+    if (/insufficient_quota|quota|billing|credits/i.test(message)) {
+      return [
+        'I tried to read the meal photo, but the OpenAI account has no available quota/credits right now 😭',
+        'Chloe needs to check OpenAI billing/credits first, then redeploy or try again.',
+        '',
+        'Once credits are active, send the meal photo again and I will estimate calories + protein + carbs + fiber 💪'
+      ].join('\n');
+    }
+
+    return [
+      'I tried to read the meal photo, but OpenAI is rate-limiting requests right now 😭',
+      'Wait a short while and try again.',
+      '',
+      'If this keeps happening, Chloe should check OpenAI usage limits for this API key 💪'
+    ].join('\n');
   }
 
   if (/OpenAI image analysis failed/.test(message)) {
