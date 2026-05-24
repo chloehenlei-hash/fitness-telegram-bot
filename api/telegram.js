@@ -32,14 +32,14 @@ async function handleTelegramUpdate(update) {
 
     if (text === '/start') {
       await sendTelegramMessage(chatId, [
-        'Hi, I am your fitness assistant.',
+        'Hey! I am your fitness buddy 💪',
         '',
-        'I can help you:',
-        '- set daily protein, carbs, fiber, fats, and calorie targets',
-        '- estimate meals from photos',
-        '- plan workouts based on gym equipment',
+        'I will help you stay on track without making fitness feel so stressful:',
+        '🥩 daily protein, carbs, fiber, fats, and calories',
+        '📸 meal photo estimates',
+        '🏋️ workout plans based on the gym equipment you have',
         '',
-        'Send /profile to set up your fitness profile.'
+        'Send /profile and we will set your targets together. Small steps count, okay? ✨'
       ].join('\n'));
       await logBotEvent({ userId, chatId, text, action: 'start', status: 'ok' });
       return;
@@ -47,28 +47,36 @@ async function handleTelegramUpdate(update) {
 
     if (text === '/profile') {
       await sendTelegramMessage(chatId, [
-        'Let us set your profile.',
+        'Yess, let us set your profile first 💪',
+        'Once I know your body data and goal, I can help you count what is left for the day.',
         '',
-        'For the first test, reply in this format:',
+        'For this first setup, reply in this format:',
         'sex, age, height cm, weight kg, goal, activity level, training days',
         '',
         'Example:',
-        'female, 28, 165, 58, fat loss, moderate, 4'
+        'female, 28, 165, 58, fat loss, moderate, 4',
+        '',
+        'Do not worry if it is not perfect. We can adjust later ✨'
       ].join('\n'));
       await logBotEvent({ userId, chatId, text, action: 'profile_prompt', status: 'ok' });
       return;
     }
 
     if (text === '/health') {
-      await sendTelegramMessage(chatId, 'Bot is connected. Supabase user save was attempted for this message.');
+      await sendTelegramMessage(chatId, 'All good, I am connected and ready to help you stay consistent 💪✨');
       await logBotEvent({ userId, chatId, text, action: 'health', status: 'ok' });
       return;
     }
 
-    await sendTelegramMessage(chatId, 'I am ready. Try /profile first, then we will add meal photos and workout planning.');
+    await sendTelegramMessage(chatId, [
+      'I am here with you 💪',
+      'Start with /profile so I can calculate your daily targets.',
+      '',
+      'After that, we will track meals, see how much protein/fiber is left, and keep going step by step ✨'
+    ].join('\n'));
     await logBotEvent({ userId, chatId, text, action: 'fallback', status: 'ok' });
   } catch (error) {
-    await safeSendTelegramMessage(chatId, 'Sorry, I hit a setup error. Please ask Chloe to check the backend environment variables and Supabase tables.');
+    await safeSendTelegramMessage(chatId, 'Oops, I hit a setup error 😭 Please ask Chloe to check the backend settings. We are close, do not give up 💪');
     await logBotEvent({ userId, chatId, text, action: 'error', status: 'error', errorMessage: error.message });
   }
 }
@@ -163,4 +171,3 @@ function requireEnv(name) {
   if (!value) throw new Error(`Missing environment variable: ${name}`);
   return value;
 }
-
