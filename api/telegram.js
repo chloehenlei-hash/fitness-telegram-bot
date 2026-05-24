@@ -1,5 +1,6 @@
 const SUPABASE_TABLES = {
   USERS: 'users',
+  TARGETS: 'nutrition_targets',
   BOT_LOGS: 'bot_logs'
 };
 
@@ -28,7 +29,7 @@ async function handleTelegramUpdate(update) {
   const text = (message.text || message.caption || '').trim();
 
   try {
-    await upsertTelegramUser({ chatId, from });
+    const user = await upsertTelegramUser({ chatId, from });
 
     if (text === '/start') {
       await sendTelegramMessage(chatId, [
@@ -48,17 +49,54 @@ async function handleTelegramUpdate(update) {
     if (text === '/profile') {
       await sendTelegramMessage(chatId, [
         'Yess, let us set your profile first 💪',
-        'Once I know your body data and goal, I can help you count what is left for the day.',
-        '',
-        'For this first setup, reply in this format:',
-        'sex, age, height cm, weight kg, goal, activity level, training days',
+        'Just tell me naturally. No need to follow a strict form.',
         '',
         'Example:',
-        'female, 28, 165, 58, fat loss, moderate, 4',
+        'I am female, 27, 160cm, 67kg, want to reach 60kg, train 3 days a week',
         '',
-        'Do not worry if it is not perfect. We can adjust later ✨'
+        '中文也可以:',
+        '女生 27岁 160cm 67kg 想瘦到60kg 一周练3天',
+        '',
+        'Send it your way. I will try my best to understand you ✨'
       ].join('\n'));
       await logBotEvent({ userId, chatId, text, action: 'profile_prompt', status: 'ok' });
+      return;
+    }
+
+    const profileDraft = parseProfileDraft(text);
+    if (profileDraft && profileDraft.profile) {
+      const updatedUser = await updateUserProfile(user.id, profileDraft.profile);
+      const targets = calculateTargets(profileDraft.profile);
+      await saveNutritionTargets(updatedUser.id, targets);
+      await sendTelegramMessage(chatId, buildTargetsReply(profileDraft.profile, targets));
+      await logBotEvent({ userId, chatId, text, action: 'profile_saved', status: 'ok' });
+      return;
+    }
+
+    if (profileDraft && profileDraft.isProfileLike) {
+      await sendTelegramMessage(chatId, buildMissingProfileReply(profileDraft));
+      await logBotEvent({ userId, chatId, text, action: 'profile_needs_more_info', status: 'ok' });
+      return;
+    }
+
+    const profile = parseProfileText(text);
+    if (profile) {
+      const updatedUser = await updateUserProfile(user.id, profile);
+      const targets = calculateTargets(profile);
+      await saveNutritionTargets(updatedUser.id, targets);
+      await sendTelegramMessage(chatId, buildTargetsReply(profile, targets));
+      await logBotEvent({ userId, chatId, text, action: 'profile_saved', status: 'ok' });
+      return;
+    }
+
+    if (text === '/targets') {
+      const targets = await getActiveTargets(user.id);
+      if (!targets) {
+        await sendTelegramMessage(chatId, 'I do not have your targets yet. Send /profile first and we will set them up together 💪');
+      } else {
+        await sendTelegramMessage(chatId, buildExistingTargetsReply(targets));
+      }
+      await logBotEvent({ userId, chatId, text, action: 'targets', status: 'ok' });
       return;
     }
 
@@ -96,9 +134,371 @@ async function upsertTelegramUser({ chatId, from }) {
 
   await supabaseFetch(`${SUPABASE_TABLES.USERS}?on_conflict=telegram_user_id`, {
     method: 'POST',
-    headers: { Prefer: 'resolution=merge-duplicates,return=minimal' },
+    headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
     body: JSON.stringify(payload)
   });
+
+  const rows = await supabaseFetch(`${SUPABASE_TABLES.USERS}?telegram_user_id=eq.${from.id}&select=*`, {
+    method: 'GET'
+  });
+  return rows && rows[0];
+}
+
+async function updateUserProfile(userId, profile) {
+  const rows = await supabaseFetch(`${SUPABASE_TABLES.USERS}?id=eq.${userId}`, {
+    method: 'PATCH',
+    headers: { Prefer: 'return=representation' },
+    body: JSON.stringify({
+      sex: profile.sex,
+      age: profile.age,
+      height_cm: profile.heightCm,
+      weight_kg: profile.weightKg,
+      goal_type: profile.goalType,
+      target_weight_kg: profile.targetWeightKg,
+      activity_level: profile.activityLevel,
+      training_days_per_week: profile.trainingDays,
+      profile_status: 'complete',
+      updated_at: new Date().toISOString()
+    })
+  });
+  return rows && rows[0];
+}
+
+async function saveNutritionTargets(userId, targets) {
+  await supabaseFetch(`${SUPABASE_TABLES.TARGETS}?user_id=eq.${userId}&active=eq.true`, {
+    method: 'PATCH',
+    body: JSON.stringify({ active: false, updated_at: new Date().toISOString() })
+  });
+
+  return supabaseFetch(SUPABASE_TABLES.TARGETS, {
+    method: 'POST',
+    headers: { Prefer: 'return=representation' },
+    body: JSON.stringify({
+      user_id: userId,
+      bmr: targets.bmr,
+      tdee: targets.tdee,
+      target_calories: targets.targetCalories,
+      protein_g: targets.proteinG,
+      carbs_g: targets.carbsG,
+      fat_g: targets.fatG,
+      fiber_g: targets.fiberG,
+      calculation_note: targets.note,
+      active: true
+    })
+  });
+}
+
+async function getActiveTargets(userId) {
+  const rows = await supabaseFetch(
+    `${SUPABASE_TABLES.TARGETS}?user_id=eq.${userId}&active=eq.true&select=*&order=created_at.desc&limit=1`,
+    { method: 'GET' }
+  );
+  return rows && rows[0];
+}
+
+function parseProfileText(text) {
+  if (!text || text.startsWith('/')) return null;
+  const parts = text.split(',').map((part) => part.trim()).filter(Boolean);
+  if (parts.length < 7) return null;
+
+  const sex = normalizeSex(parts[0]);
+  const age = toNumber(parts[1]);
+  const heightCm = toNumber(parts[2]);
+  const weightKg = toNumber(parts[3]);
+  const fifth = parts[4].toLowerCase();
+  const activityLevel = normalizeActivity(parts[5]);
+  const trainingDays = Math.round(toNumber(parts[6]));
+
+  if (!sex || !age || !heightCm || !weightKg || !activityLevel || Number.isNaN(trainingDays)) {
+    return null;
+  }
+
+  let goalType = normalizeGoal(fifth);
+  let targetWeightKg = null;
+
+  if (!goalType) {
+    targetWeightKg = toNumber(fifth);
+    if (!targetWeightKg) return null;
+    goalType = inferGoalFromTarget(weightKg, targetWeightKg);
+  }
+
+  return {
+    sex,
+    age,
+    heightCm,
+    weightKg,
+    goalType,
+    targetWeightKg,
+    activityLevel,
+    trainingDays: Math.max(0, Math.min(trainingDays, 7))
+  };
+}
+
+function parseProfileDraft(text) {
+  if (!text || text.startsWith('/')) return null;
+  const commaProfile = parseProfileText(text);
+  if (commaProfile) return { isProfileLike: true, profile: commaProfile, missing: [] };
+
+  const normalized = normalizeMessage(text);
+  const sex = extractSex(normalized);
+  const age = extractAge(normalized);
+  const heightCm = extractHeight(normalized);
+  const weights = extractWeights(normalized);
+  const weightKg = weights.current;
+  const targetWeightKg = weights.target;
+  const explicitGoal = normalizeGoal(normalized);
+  const trainingDays = extractTrainingDays(normalized);
+  const activityLevel = extractActivity(normalized, trainingDays);
+  const goalType = explicitGoal || (weightKg && targetWeightKg ? inferGoalFromTarget(weightKg, targetWeightKg) : null);
+
+  const fields = { sex, age, heightCm, weightKg, goalType, activityLevel, trainingDays };
+  const presentCount = Object.values(fields).filter((value) => value !== null && value !== undefined && !Number.isNaN(value)).length;
+  const isProfileLike = presentCount >= 3 || /profile|target|goal|weight|height|protein|calorie|女生|男生|身高|体重|目标|瘦|增肌|减脂|一周|训练|健身/i.test(normalized);
+  if (!isProfileLike) return null;
+
+  const missing = [];
+  if (!sex) missing.push('sex');
+  if (!age) missing.push('age');
+  if (!heightCm) missing.push('height');
+  if (!weightKg) missing.push('current weight');
+  if (!goalType && !targetWeightKg) missing.push('goal or target weight');
+  if (!activityLevel) missing.push('activity level');
+  if (trainingDays === null || Number.isNaN(trainingDays)) missing.push('training days per week');
+
+  if (missing.length) {
+    return {
+      isProfileLike: true,
+      missing,
+      understood: {
+        sex,
+        age,
+        heightCm,
+        weightKg,
+        targetWeightKg,
+        goalType,
+        activityLevel,
+        trainingDays
+      }
+    };
+  }
+
+  return {
+    isProfileLike: true,
+    missing: [],
+    profile: {
+      sex,
+      age,
+      heightCm,
+      weightKg,
+      goalType,
+      targetWeightKg: targetWeightKg || null,
+      activityLevel,
+      trainingDays: Math.max(0, Math.min(Math.round(trainingDays), 7))
+    }
+  };
+}
+
+function calculateTargets(profile) {
+  const isMale = profile.sex === 'male';
+  const bmr = isMale
+    ? 10 * profile.weightKg + 6.25 * profile.heightCm - 5 * profile.age + 5
+    : 10 * profile.weightKg + 6.25 * profile.heightCm - 5 * profile.age - 161;
+
+  const multipliers = {
+    sedentary: 1.2,
+    light: 1.375,
+    moderate: 1.55,
+    active: 1.725,
+    'very active': 1.9
+  };
+  const tdee = bmr * multipliers[profile.activityLevel];
+  const adjustments = {
+    'fat loss': 0.85,
+    'muscle gain': 1.1,
+    maintenance: 1,
+    recomposition: 0.95
+  };
+  const targetCalories = tdee * adjustments[profile.goalType];
+  const proteinRate = profile.goalType === 'fat loss' ? 2 : profile.goalType === 'maintenance' ? 1.6 : 1.8;
+  const proteinG = profile.weightKg * proteinRate;
+  const fatG = profile.weightKg * 0.8;
+  const carbsG = Math.max(0, (targetCalories - proteinG * 4 - fatG * 9) / 4);
+  const fiberG = Math.min(35, Math.max(25, targetCalories / 1000 * 14));
+
+  return {
+    bmr: Math.round(bmr),
+    tdee: Math.round(tdee),
+    targetCalories: Math.round(targetCalories),
+    proteinG: Math.round(proteinG),
+    carbsG: Math.round(carbsG),
+    fatG: Math.round(fatG),
+    fiberG: Math.round(fiberG),
+    note: 'Mifflin-St Jeor estimate with MVP macro rules.'
+  };
+}
+
+function buildTargetsReply(profile, targets) {
+  const targetLine = profile.targetWeightKg ? `Target weight: ${profile.targetWeightKg}kg\n` : '';
+  return [
+    'Profile saved! Nice start 💪✨',
+    '',
+    `Goal: ${formatGoal(profile.goalType)}`,
+    targetLine.trim(),
+    'Your daily targets:',
+    `🔥 Calories: ${targets.targetCalories} kcal`,
+    `🥩 Protein: ${targets.proteinG}g`,
+    `🍚 Carbs: ${targets.carbsG}g`,
+    `🥑 Fat: ${targets.fatG}g`,
+    `🥦 Fiber: ${targets.fiberG}g`,
+    '',
+    `Protein goal is ${targets.proteinG}g. 加油, we will close it meal by meal 💪`,
+    'Next: send /targets anytime to see this again.'
+  ].filter(Boolean).join('\n');
+}
+
+function buildMissingProfileReply(draft) {
+  const understoodLines = [];
+  const data = draft.understood || {};
+  if (data.sex) understoodLines.push(`Sex: ${data.sex}`);
+  if (data.age) understoodLines.push(`Age: ${data.age}`);
+  if (data.heightCm) understoodLines.push(`Height: ${data.heightCm}cm`);
+  if (data.weightKg) understoodLines.push(`Current weight: ${data.weightKg}kg`);
+  if (data.targetWeightKg) understoodLines.push(`Target weight: ${data.targetWeightKg}kg`);
+  if (data.goalType) understoodLines.push(`Goal: ${formatGoal(data.goalType)}`);
+  if (data.activityLevel) understoodLines.push(`Activity: ${data.activityLevel}`);
+  if (data.trainingDays !== null && data.trainingDays !== undefined && !Number.isNaN(data.trainingDays)) {
+    understoodLines.push(`Training: ${data.trainingDays} days/week`);
+  }
+
+  return [
+    'I think I got part of it 💪',
+    understoodLines.length ? understoodLines.join('\n') : '',
+    '',
+    `Can you send me the missing part: ${draft.missing.join(', ')}?`,
+    '',
+    'You can reply naturally, for example:',
+    '女生 27岁 160cm 67kg 想瘦到60kg 一周练3天 ✨'
+  ].filter(Boolean).join('\n');
+}
+
+function buildExistingTargetsReply(targets) {
+  return [
+    'Here are your daily targets 💪',
+    '',
+    `🔥 Calories: ${targets.target_calories} kcal`,
+    `🥩 Protein: ${targets.protein_g}g`,
+    `🍚 Carbs: ${targets.carbs_g}g`,
+    `🥑 Fat: ${targets.fat_g}g`,
+    `🥦 Fiber: ${targets.fiber_g}g`,
+    '',
+    'Keep going. One good meal at a time ✨'
+  ].join('\n');
+}
+
+function normalizeSex(value) {
+  const text = String(value || '').toLowerCase();
+  if (['female', 'f', 'woman', 'girl'].includes(text) || /\b(female|woman|girl)\b|女生|女性|女孩子|女\b/.test(text)) return 'female';
+  if (['male', 'm', 'man', 'boy'].includes(text) || /\b(male|man|boy)\b|男生|男性|男孩子|男\b/.test(text)) return 'male';
+  return null;
+}
+
+function normalizeGoal(value) {
+  const text = String(value || '').toLowerCase().replace(/[_-]/g, ' ').trim();
+  if (['fat loss', 'lose fat', 'cut', 'weight loss', 'slim'].includes(text) || /\b(fat loss|lose fat|weight loss|slim|cut)\b|减脂|减肥|瘦|想瘦|变瘦/.test(text)) return 'fat loss';
+  if (['muscle gain', 'gain muscle', 'bulk', 'build muscle'].includes(text) || /\b(muscle gain|gain muscle|build muscle|bulk)\b|增肌|长肌肉|练大/.test(text)) return 'muscle gain';
+  if (['maintenance', 'maintain'].includes(text) || /\b(maintenance|maintain)\b/.test(text)) return 'maintenance';
+  if (['recomposition', 'recomp', 'body recomposition'].includes(text) || /\b(recomposition|recomp|body recomposition)\b|塑形|体态|线条/.test(text)) return 'recomposition';
+  return null;
+}
+
+function inferGoalFromTarget(weightKg, targetWeightKg) {
+  if (targetWeightKg < weightKg - 1) return 'fat loss';
+  if (targetWeightKg > weightKg + 1) return 'muscle gain';
+  return 'maintenance';
+}
+
+function normalizeActivity(value) {
+  const text = String(value || '').toLowerCase().replace(/[_-]/g, ' ').trim();
+  if (['sedentary', 'low'].includes(text) || /久坐|很少动|不太动/.test(text)) return 'sedentary';
+  if (['light', 'lightly active'].includes(text) || /轻度|偶尔|少量/.test(text)) return 'light';
+  if (['moderate', 'moderately active', 'medium'].includes(text) || /中等|普通|一般/.test(text)) return 'moderate';
+  if (['active', 'high'].includes(text) || /活跃|经常|高活动/.test(text)) return 'active';
+  if (['very active', 'very'].includes(text) || /非常活跃|每天练|运动量很大/.test(text)) return 'very active';
+  return null;
+}
+
+function normalizeMessage(text) {
+  return String(text || '')
+    .replace(/[，。；;|]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
+function extractSex(text) {
+  return normalizeSex(text);
+}
+
+function extractAge(text) {
+  const explicit = text.match(/(\d{1,2})\s*(岁|years?\s*old|yo|y\/o)/i);
+  if (explicit) return Number(explicit[1]);
+  const intro = text.match(/\b(?:age|aged)\s*(?:is|:)?\s*(\d{1,2})\b/i);
+  if (intro) return Number(intro[1]);
+  const numbers = getNumbers(text);
+  return numbers.find((number) => number >= 13 && number <= 85) || null;
+}
+
+function extractHeight(text) {
+  const explicit = text.match(/(\d{2,3}(?:\.\d+)?)\s*(cm|厘米|公分)/i);
+  if (explicit) return Number(explicit[1]);
+  const labeled = text.match(/(?:height|身高)\s*(?:is|:)?\s*(\d{2,3}(?:\.\d+)?)/i);
+  if (labeled) return Number(labeled[1]);
+  return null;
+}
+
+function extractWeights(text) {
+  const weightMatches = [...text.matchAll(/(\d{2,3}(?:\.\d+)?)\s*(kg|公斤|kilo|kilogram)/gi)].map((match) => Number(match[1]));
+  let current = weightMatches[0] || null;
+  let target = weightMatches[1] || null;
+
+  const currentMatch = text.match(/(?:current weight|weight|体重|现在|目前)\s*(?:is|:)?\s*(\d{2,3}(?:\.\d+)?)/i);
+  if (currentMatch) current = Number(currentMatch[1]);
+
+  const targetMatch = text.match(/(?:target|goal weight|目标|瘦到|减到|到|reach)\s*(?:is|:)?\s*(\d{2,3}(?:\.\d+)?)/i);
+  if (targetMatch) target = Number(targetMatch[1]);
+
+  return { current, target };
+}
+
+function extractTrainingDays(text) {
+  const explicit = text.match(/(\d(?:\.\d+)?)\s*(days?|天|次)\s*(?:a|per)?\s*(?:week|weekly|每周|一周)?/i);
+  if (explicit) return Number(explicit[1]);
+  const cn = text.match(/(?:一周|每周|weekly|week)\s*(?:练|训练|workout|train)?\s*(\d(?:\.\d+)?)\s*(?:天|次|days?)?/i);
+  if (cn) return Number(cn[1]);
+  return null;
+}
+
+function extractActivity(text, trainingDays) {
+  const activity = normalizeActivity(text);
+  if (activity) return activity;
+  if (trainingDays === null || trainingDays === undefined || Number.isNaN(trainingDays)) return null;
+  if (trainingDays <= 1) return 'light';
+  if (trainingDays <= 4) return 'moderate';
+  if (trainingDays <= 6) return 'active';
+  return 'very active';
+}
+
+function getNumbers(text) {
+  return [...String(text || '').matchAll(/\d+(?:\.\d+)?/g)].map((match) => Number(match[0]));
+}
+
+function formatGoal(goal) {
+  return goal.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function toNumber(value) {
+  const match = String(value || '').match(/-?\d+(\.\d+)?/);
+  return match ? Number(match[0]) : NaN;
 }
 
 async function logBotEvent({ userId, chatId, text, action, status, errorMessage = '' }) {
