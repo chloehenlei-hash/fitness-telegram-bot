@@ -53,9 +53,20 @@ async function handleTelegramUpdate(update) {
         '📸 meal photo estimates',
         '🏋️ workout plans based on the gym equipment you have',
         '',
+        'First, tell me your language:',
+        '中文 or English',
+        '',
         'Send /profile and we will set your targets together. Small steps count, okay? ✨'
       ].join('\n'));
       await logBotEvent({ userId, chatId, text, action: 'start', status: 'ok' });
+      return;
+    }
+
+    const languageChoice = parseLanguageChoice(text);
+    if (languageChoice) {
+      await saveLanguagePreference(user.id, languageChoice);
+      await sendTelegramMessage(chatId, buildLanguageSavedReply(languageChoice));
+      await logBotEvent({ userId, chatId, text, action: 'language_saved', status: 'ok' });
       return;
     }
 
@@ -120,7 +131,7 @@ async function handleTelegramUpdate(update) {
     }
 
     const targets = await getActiveTargets(user.id);
-    await sendTelegramMessage(chatId, buildFallbackReply(Boolean(targets)));
+    await sendTelegramMessage(chatId, buildFallbackReply(Boolean(targets), user.language_preference));
     await logBotEvent({ userId, chatId, text, action: 'fallback', status: 'ok' });
   } catch (error) {
     await safeSendTelegramMessage(chatId, 'Oops, I hit a setup error 😭 Please ask Chloe to check the backend settings. We are close, do not give up 💪');
@@ -173,6 +184,20 @@ async function updateUserProfile(userId, profile) {
   return rows && rows[0];
 }
 
+async function saveLanguagePreference(userId, language) {
+  try {
+    await supabaseFetch(`${SUPABASE_TABLES.USERS}?id=eq.${userId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        language_preference: language,
+        updated_at: new Date().toISOString()
+      })
+    });
+  } catch (error) {
+    console.error('failed to save language preference', error);
+  }
+}
+
 async function saveNutritionTargets(userId, targets) {
   await supabaseFetch(`${SUPABASE_TABLES.TARGETS}?user_id=eq.${userId}&active=eq.true`, {
     method: 'PATCH',
@@ -217,7 +242,9 @@ async function handleMealPhoto({ chatId, userId, user, message, caption }) {
     return;
   }
 
-  await sendTelegramMessage(chatId, 'Got your meal photo 📸 Give me a moment, I am estimating it now...');
+  await sendTelegramMessage(chatId, user.language_preference === 'zh'
+    ? '收到你的餐照 📸 等我一下，我来帮你估算一下...'
+    : 'Got your meal photo 📸 Give me a moment, I am estimating it now...');
 
   const photo = message.photo[message.photo.length - 1];
   const image = await downloadTelegramPhoto(photo.file_id);
@@ -243,7 +270,12 @@ async function handleMealPhoto({ chatId, userId, user, message, caption }) {
   });
 
   const consumedAfter = addMealToConsumed(consumedBefore, estimate);
-  await sendTelegramMessage(chatId, buildMealEstimateReply({ estimate, targets, consumedAfter }));
+  await sendTelegramMessage(chatId, buildMealEstimateReply({
+    estimate,
+    targets,
+    consumedAfter,
+    language: user.language_preference
+  }));
 }
 
 async function downloadTelegramPhoto(fileId) {
@@ -435,33 +467,121 @@ function buildMealEstimateReply({ estimate, targets, consumedAfter }) {
   const remainingFiber = Math.max(0, Math.round(Number(targets.fiber_g || 0) - consumedAfter.fiberG));
   const remainingCalories = Math.max(0, Math.round(Number(targets.target_calories || 0) - consumedAfter.calories));
   const foods = Array.isArray(estimate.foods) && estimate.foods.length ? estimate.foods.join(', ') : 'Meal from photo';
+  const isZh = arguments[0] && arguments[0].language === 'zh';
+  const joke = buildMealJoke(foods, estimate, isZh);
+
+  if (isZh) {
+    return [
+      '餐点估算 📸',
+      '',
+      `食物：${foods}`,
+      estimate.portion_assumption ? `份量：${estimate.portion_assumption}` : '',
+      '',
+      `🔥 Calories：${Math.round(estimate.calories)} kcal`,
+      '',
+      `🥩 Protein：${Math.round(estimate.protein_g)}g`,
+      `🍚 Carbs：${Math.round(estimate.carbs_g)}g`,
+      `🥑 Fat：${Math.round(estimate.fat_g)}g`,
+      `🥦 Fiber：${Math.round(estimate.fiber_g)}g`,
+      '',
+      'Today so far：',
+      '',
+      `🔥 Calories：${Math.round(consumedAfter.calories)} / ${targets.target_calories}`,
+      `🥩 Protein：${Math.round(consumedAfter.proteinG)} / ${targets.protein_g}g`,
+      `🍚 Carbs：${Math.round(consumedAfter.carbsG)} / ${targets.carbs_g}g`,
+      `🥦 Fiber：${Math.round(consumedAfter.fiberG)} / ${targets.fiber_g}g`,
+      '',
+      'Still left：',
+      '',
+      `🥩 Protein：${remainingProtein}g`,
+      `🍚 Carbs：${remainingCarbs}g`,
+      `🥦 Fiber：${remainingFiber}g`,
+      `🔥 Calories：${remainingCalories} kcal`,
+      '',
+      joke,
+      '',
+      estimate.tip || `加油，protein 还剩 ${remainingProtein}g。下一餐补回来就好，不要放弃 💪`,
+      `Confidence：${estimate.confidence || 'low'}`
+    ].filter(Boolean).join('\n');
+  }
 
   return [
     'Meal estimate 📸',
+    '',
     `Food: ${foods}`,
     estimate.portion_assumption ? `Portion: ${estimate.portion_assumption}` : '',
     '',
     `🔥 Calories: ${Math.round(estimate.calories)} kcal`,
+    '',
     `🥩 Protein: ${Math.round(estimate.protein_g)}g`,
     `🍚 Carbs: ${Math.round(estimate.carbs_g)}g`,
     `🥑 Fat: ${Math.round(estimate.fat_g)}g`,
     `🥦 Fiber: ${Math.round(estimate.fiber_g)}g`,
     '',
     'Today so far:',
+    '',
     `🔥 Calories: ${Math.round(consumedAfter.calories)} / ${targets.target_calories}`,
     `🥩 Protein: ${Math.round(consumedAfter.proteinG)} / ${targets.protein_g}g`,
     `🍚 Carbs: ${Math.round(consumedAfter.carbsG)} / ${targets.carbs_g}g`,
     `🥦 Fiber: ${Math.round(consumedAfter.fiberG)} / ${targets.fiber_g}g`,
     '',
     'Still left:',
+    '',
     `🥩 Protein: ${remainingProtein}g`,
     `🍚 Carbs: ${remainingCarbs}g`,
     `🥦 Fiber: ${remainingFiber}g`,
     `🔥 Calories: ${remainingCalories} kcal`,
     '',
+    joke,
+    '',
     estimate.tip || `加油, protein 还剩 ${remainingProtein}g. We can close it with the next meal 💪`,
     `Confidence: ${estimate.confidence || 'low'}`
   ].filter(Boolean).join('\n');
+}
+
+function buildMealJoke(foods, estimate, isZh) {
+  const text = String(foods || '').toLowerCase();
+  const calories = Number(estimate.calories || 0);
+  const fat = Number(estimate.fat_g || 0);
+  const carbs = Number(estimate.carbs_g || 0);
+  const isSpicyNoodle = /mala|麻辣|panmee|pan mee|板面|面|noodle/.test(text);
+  const isHeavy = calories >= 650 || fat >= 25 || carbs >= 80;
+
+  if (isZh) {
+    if (isSpicyNoodle || isHeavy) {
+      return '小小吐槽一下：这个看起来很爽，但也不是天天都能这样吃啦 😭 下一餐乖一点，来点 protein + 菜，身体会谢谢你。';
+    }
+    return '这餐还可以，继续保持。不要太得意，下一餐还是要认真一点 😌';
+  }
+
+  if (isSpicyNoodle || isHeavy) {
+    return 'Tiny coach roast: this looks delicious, but your fitness goal is side-eyeing you a bit 😭 Next meal, let us go cleaner with protein + veggies.';
+  }
+  return 'Not bad. Your fitness goal is not panicking today 😌 Keep going.';
+}
+
+function parseLanguageChoice(text) {
+  const normalized = String(text || '').trim().toLowerCase();
+  if (/^(中文|chinese|华语|mandarin|cn|zh)$/i.test(normalized)) return 'zh';
+  if (/^(english|英文|eng|en)$/i.test(normalized)) return 'en';
+  return null;
+}
+
+function buildLanguageSavedReply(language) {
+  if (language === 'zh') {
+    return [
+      '好，我之后尽量用中文跟你说 💪',
+      '',
+      '你可以发 /profile 设置资料，或者直接自然地说：',
+      '女生 27岁 160cm 67kg 想瘦到60kg 一周练3天 ✨'
+    ].join('\n');
+  }
+
+  return [
+    'Done, I will reply in English 💪',
+    '',
+    'Send /profile to set your body data, or just tell me naturally.'
+  ].join('\n');
 }
 
 function parseProfileText(text) {
@@ -845,8 +965,22 @@ function isSupportedImageMime(mimeType) {
   return ['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(String(mimeType || '').toLowerCase());
 }
 
-function buildFallbackReply(hasTargets) {
+function buildFallbackReply(hasTargets, language = 'en') {
+  const isZh = language === 'zh';
   if (hasTargets) {
+    if (isZh) {
+      return [
+        '你的 profile 已经存好了 💪',
+        '',
+        '你现在可以发：',
+        '📸 餐照，例如 “mala panmee”',
+        '🎯 /targets 看每日目标',
+        '🏋️ 想练哪里 + 健身房有什么器械',
+        '',
+        '不用一直重新设 profile，我们继续往前走 ✨'
+      ].join('\n');
+    }
+
     return [
       'I have your profile saved already 💪',
       '',
@@ -856,6 +990,15 @@ function buildFallbackReply(hasTargets) {
       '🏋️ what you want to train and what machines you have',
       '',
       'No need to set profile again. We keep going from here ✨'
+    ].join('\n');
+  }
+
+  if (isZh) {
+    return [
+      '我在这边 💪',
+      '先发 /profile，让我帮你算每日目标。',
+      '',
+      '之后你发餐照，我就会帮你看今天还差多少 protein / fiber ✨'
     ].join('\n');
   }
 
